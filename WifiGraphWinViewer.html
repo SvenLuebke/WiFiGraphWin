@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WifiGraphWin Log Viewer</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2028;--mut:#667085;--grid:#e3e6eb;--bd:#d0d5dd;--acc:#2f6fed;
+ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15171c;--card:#1d2027;--fg:#e4e7ec;--mut:#98a2b3;--grid:#2e333d;--bd:#394150;--acc:#6ea0ff;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#15171c;--card:#1d2027;--fg:#e4e7ec;--mut:#98a2b3;--grid:#2e333d;--bd:#394150;--acc:#6ea0ff;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 4px}
+p.sub{margin:0 0 14px;color:var(--mut)}
+#drop{display:block;border:2px dashed var(--bd);border-radius:12px;padding:26px 16px;text-align:center;color:var(--mut);cursor:pointer;background:var(--card)}
+#drop.over{border-color:var(--acc);color:var(--fg)}
+#drop b{color:var(--fg)}
+#drop input{display:none}
+#ui{display:none;margin-top:14px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.bar .grow{flex:1}
+button,.chip{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:5px 11px;cursor:pointer}
+button:hover{border-color:var(--acc)}
+.chip{display:inline-flex;gap:6px;align-items:center;user-select:none}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 12px 6px;margin-bottom:12px}
+.card h2{font-size:14px;margin:0 0 4px}
+.card h2 small{font-weight:400;color:var(--mut)}
+.wrap{position:relative;height:230px;touch-action:pan-y}
+.wrap canvas{position:absolute;inset:0;width:100%;height:100%}
+#tip{position:fixed;z-index:5;pointer-events:none;display:none;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:6px 9px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.25);max-width:340px}
+#msg{margin-top:10px;color:#d92d20}
+.hint{color:var(--mut);font-size:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>WiFi Log Viewer</h1>
+<p class="sub">Shows the CSV written by <code>WifiGraphWin.exe</code>. The file is read locally in your browser and is never uploaded.</p>
+
+<label id="drop"><input id="file" type="file" accept=".csv,text/csv" multiple>
+ Drop <b>WifiGraphWin_log.csv</b> here or <b>click to choose</b> a file</label>
+<div id="msg"></div>
+
+<div id="ui">
+ <div class="bar">
+  <span id="chips" class="bar" style="margin:0"></span>
+  <span class="grow"></span>
+  <button id="export-svg">Export interactive SVG</button>
+  <button id="export">Export high-quality PNG</button>
+  <button data-r="all">All</button><button data-r="3600">Last hour</button><button data-r="900">Last 15 min</button><button data-r="zoom">Reset zoom</button>
+ </div>
+ <div class="hint" id="info"></div>
+ <div id="charts" style="margin-top:10px"></div>
+ <div class="hint">Tip: drag on a graph to zoom into a time range, double-click to reset. Solid line = TX / upload, dashed line = RX / download.</div>
+</div>
+</main>
+<div id="tip"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const COLORS=['#3ddc84','#4ea3ff','#ffa63c','#e664c8','#d9b800','#2fc4d6'];
+const PANELS=[
+ {id:'link',title:'Link rate',unit:'Mbps',lines:[{k:'tx',n:'TX',s:1},{k:'rx',n:'RX',s:0}]},
+ {id:'thr',title:'Throughput',unit:'KB/s',bytes:1,lines:[{k:'up',n:'Upload',s:1},{k:'dn',n:'Download',s:0}]},
+ {id:'sig',title:'Signal strength',unit:'dBm',fixed:[-100,-30],lines:[{k:'dbm',n:'Signal',s:1}]}
+];
+let S=[],on=new Set(),full=[0,0],view=[0,0],drag=null;
+
+function splitLine(l){const o=[];let c='',q=false;for(let i=0;i<l.length;i++){const ch=l[i];
+ if(q){if(ch=='"'){if(l[i+1]=='"'){c+='"';i++}else q=false}else c+=ch}
+ else if(ch=='"')q=true;else if(ch==','){o.push(c);c=''}else c+=ch}o.push(c);return o}
+
+function parse(txt){
+ const L=txt.replace(/^\uFEFF/,'').split(/\r?\n/).filter(x=>x.trim());if(L.length<2)return[];
+ const h=splitLine(L[0]).map(s=>s.trim().toLowerCase());
+ const ix=(...n)=>{for(const k of n){const i=h.indexOf(k);if(i>=0)return i}return -1};
+ const I={t:ix('timestamp'),ad:ix('adapter'),ssid:ix('ssid'),tx:ix('link_tx_mbps','tx_mbps'),rx:ix('link_rx_mbps','rx_mbps'),
+  up:ix('upload_kbps'),dn:ix('download_kbps'),dbm:ix('signal_dbm'),pct:ix('signal_percent')};
+ if(I.t<0)return[];
+ const n=(f,i)=>{if(i<0)return NaN;const v=f[i];return v===undefined||v.trim()===''?NaN:+v};
+ const out=[];
+ for(let k=1;k<L.length;k++){const f=splitLine(L[k]);const t=Date.parse((f[I.t]||'').trim().replace(' ','T'));if(isNaN(t))continue;
+  out.push({t,ad:I.ad>=0?f[I.ad]:'WiFi',ssid:I.ssid>=0?f[I.ssid]:'',tx:n(f,I.tx),rx:n(f,I.rx),
+   up:n(f,I.up)*1000,dn:n(f,I.dn)*1000,dbm:n(f,I.dbm),pct:n(f,I.pct)})}
+ return out}
+
+async function load(files){
+ $('#msg').textContent='';let rows=[];
+ for(const f of files)rows=rows.concat(parse(await f.text()));
+ if(!rows.length){$('#msg').textContent='No usable rows found. Expected the CSV written by wifimon.exe (header line with “timestamp”).';return}
+ rows.sort((a,b)=>a.t-b.t);
+ const m=new Map();for(const r of rows){if(!m.has(r.ad))m.set(r.ad,[]);m.get(r.ad).push(r)}
+ S=[...m].map(([name,pts],i)=>{const d=[];for(let k=1;k<pts.length;k++)d.push(pts[k].t-pts[k-1].t);d.sort((a,b)=>a-b);
+  const med=d.length?d[d.length>>1]:1000;return{name,pts,color:COLORS[i%COLORS.length],gap:Math.max(5000,med*4)}});
+ on=new Set(S.map(s=>s.name));
+ full=[rows[0].t,rows[rows.length-1].t+1];view=full.slice();
+ $('#chips').innerHTML='';
+ S.forEach(s=>{const c=document.createElement('label');c.className='chip';
+  c.innerHTML=`<input type="checkbox" checked><span class="dot" style="background:${s.color}"></span>${s.name.replace(/</g,'&lt;')}`;
+  c.firstChild.onchange=e=>{e.target.checked?on.add(s.name):on.delete(s.name);layout()};$('#chips').appendChild(c)});
+ build();$('#ui').style.display='block';
+ $('#info').textContent=`${rows.length.toLocaleString()} samples · ${S.length} adapter${S.length>1?'s':''} · ${fmtT(full[0],1e12)} to ${fmtT(full[1],1e12)}`;
+ layout()}
+
+function build(){
+ const box=$('#charts');box.innerHTML='';
+ PANELS.forEach(P=>{
+  P.has=S.some(s=>s.pts.some(p=>P.lines.some(l=>isFinite(p[l.k]))));if(!P.has)return;
+  const c=document.createElement('div');c.className='card';
+  c.innerHTML='<h2></h2><div class="wrap"><canvas></canvas><canvas></canvas></div>';
+  P.h=c.querySelector('h2');[P.cv,P.ov]=c.querySelectorAll('canvas');P.wrap=c.querySelector('.wrap');box.appendChild(c);
+  const W=P.wrap;
+  W.onpointermove=e=>{hover(e,P)};W.onpointerleave=()=>{if(!drag){clearOv();$('#tip').style.display='none'}};
+  W.onpointerdown=e=>{drag={P,x0:e.offsetX,x1:e.offsetX};W.setPointerCapture(e.pointerId)};
+  W.onpointerup=e=>{if(!drag)return;const d=drag;drag=null;if(Math.abs(d.x1-d.x0)>6){const a=tAt(P,d.x0),b=tAt(P,d.x1);view=[Math.min(a,b),Math.max(a,b)];layout()}clearOv()};
+  W.ondblclick=()=>{view=full.slice();layout()}})}
+
+const pad2=n=>String(n).padStart(2,'0');
+function fmtT(t,span){const d=new Date(t);const hm=`${pad2(d.getHours())}:${pad2(d.getMinutes())}`,date=`${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+ if(span>=1e12)return date+' '+hm;if(span>2*864e5)return `${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${hm}`;
+ return span>5*6e4?hm:hm+':'+pad2(d.getSeconds())}
+const fmtRate=b=>b>=1e6?(b/1e6).toFixed(2)+' MB/s':(b/1e3).toFixed(1)+' KB/s';
+function nice(v){if(!(v>0))return 1;v*=1.1;const p=Math.pow(10,Math.floor(Math.log10(v)));for(const m of[1,1.5,2,2.5,3,4,5,6,8,10])if(v<=m*p)return m*p;return 10*p}
+function lb(a,t){let lo=0,hi=a.length;while(lo<hi){const m=(lo+hi)>>1;a[m].t<t?lo=m+1:hi=m}return lo}
+const M={l:58,r:12,t:8,b:22};
+
+function layout(){
+ const[t0,t1]=view,vis=S.filter(s=>on.has(s.name));
+ PANELS.forEach(P=>{if(!P.has)return;
+  if(P.fixed){[P.lo,P.hi]=P.fixed;P.sc=1;P.u=P.unit}
+  else{let m=0;for(const s of vis){const i=lb(s.pts,t0),j=lb(s.pts,t1);for(let k=i;k<j;k++){const p=s.pts[k];for(const l of P.lines){const v=p[l.k];if(v>m)m=v}}}
+   P.lo=0;P.sc=1;P.u=P.unit;if(P.bytes){P.sc=m>=1e6?1e-6:1e-3;P.u=m>=1e6?'MB/s':'KB/s'}P.hi=nice(m*P.sc)}
+  P.h.innerHTML=`${P.title} <small>(${P.u})</small>`});
+ draw()}
+
+function size(cv){const d=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;if(cv.width!=w*d||cv.height!=h*d){cv.width=w*d;cv.height=h*d}
+ const g=cv.getContext('2d');g.setTransform(d,0,0,d,0,0);g.clearRect(0,0,w,h);return[g,w,h]}
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function draw(){PANELS.forEach(P=>{if(!P.has)return;
+ const[g,W,H]=size(P.cv);drawPanel(P,g,W,H)})}
+
+function drawPanel(P,g,W,H){
+ const w=W-M.l-M.r,h=H-M.t-M.b,[t0,t1]=view;
+ const X=t=>M.l+(t-t0)/(t1-t0)*w,Y=v=>M.t+h-(v-P.lo)/(P.hi-P.lo)*h;
+ g.font='11px system-ui,sans-serif';g.lineWidth=1;g.strokeStyle=css('--grid');g.fillStyle=css('--mut');
+ const dec=P.hi-P.lo<2?2:P.hi-P.lo<20?1:0;
+ g.textAlign='right';g.textBaseline='middle';
+ for(let i=0;i<=5;i++){const v=P.lo+(P.hi-P.lo)*i/5,y=Math.round(Y(v))+.5;g.beginPath();g.moveTo(M.l,y);g.lineTo(M.l+w,y);g.stroke();g.fillText(v.toFixed(dec),M.l-6,y)}
+ g.textBaseline='top';
+ for(let i=0;i<=5;i++){const x=Math.round(M.l+w*i/5)+.5;g.beginPath();g.moveTo(x,M.t);g.lineTo(x,M.t+h);g.stroke();
+  g.textAlign=i==0?'left':i==5?'right':'center';g.fillText(fmtT(t0+(t1-t0)*i/5,t1-t0),x,M.t+h+5)}
+ g.save();g.beginPath();g.rect(M.l,M.t-2,w+1,h+4);g.clip();g.lineJoin='round';
+ for(const s of S){if(!on.has(s.name))continue;g.strokeStyle=s.color;
+  for(const l of P.lines){g.lineWidth=l.s?2:1.5;g.setLineDash(l.s?[]:[5,3]);line(g,s,l.k,t0,t1,X,Y,P.sc,w)}}
+ g.restore()}
+
+function exportSvg(){
+ const charts=$('#charts'),cards=[...charts.querySelectorAll('.card')],width=charts.clientWidth;
+ if(!cards.length||!width){$('#msg').textContent='There are no charts to export.';return}
+ const gap=12,height=cards.reduce((sum,c)=>sum+c.clientHeight,0)+gap*(cards.length-1);
+ try{
+ const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');
+ const add=(parent,name,attrs={})=>{const el=document.createElementNS(ns,name);for(const[k,v]of Object.entries(attrs))el.setAttribute(k,v);parent.appendChild(el);return el};
+ const text=(parent,x,y,value,attrs={})=>{const el=add(parent,'text',{x,y,...attrs});el.textContent=value;return el};
+ svg.setAttribute('xmlns',ns);svg.setAttribute('width',width);svg.setAttribute('height',height);
+ svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+ const title=add(svg,'title');title.textContent='WiFi log charts — drag across a chart to zoom to a time range; double-click to reset.';
+ const palette={bg:css('--bg'),card:css('--card'),fg:css('--fg'),mut:css('--mut'),grid:css('--grid'),bd:css('--bd')};
+ add(svg,'rect',{width,height,fill:palette.bg});
+ const series=S.filter(s=>on.has(s.name));
+ const hoverData=series.map(s=>({name:s.name,color:s.color,gap:s.gap,pts:s.pts.map(p=>[p.t,p.tx,p.rx,p.up,p.dn,p.dbm,p.pct,p.ssid])}));
+ const metadata=add(svg,'metadata',{id:'hover-data'});metadata.textContent=JSON.stringify(hoverData);
+ const overlays=[];
+ let y=0,index=0;
+ for(const card of cards){
+  const P=PANELS.find(p=>p.cv===card.querySelector('canvas'));
+  if(!P)continue;
+  const cardHeight=card.clientHeight,cardRect=card.getBoundingClientRect();
+  const headingRect=card.querySelector('h2').getBoundingClientRect(),wrap=card.querySelector('.wrap');
+  const wrapRect=wrap.getBoundingClientRect(),wrapX=wrapRect.left-cardRect.left,wrapY=y+wrapRect.top-cardRect.top;
+  const group=add(svg,'g',{'data-chart':index++});
+  add(group,'rect',{x:.5,y:y+.5,width:width-1,height:cardHeight-1,rx:12,fill:palette.card,stroke:palette.bd});
+  const titleY=y+headingRect.top-cardRect.top+15;
+  text(group,13,titleY,P.title,{fill:palette.fg,'font-family':'system-ui,sans-serif','font-size':14,'font-weight':600});
+  const measure=document.createElement('canvas').getContext('2d');
+  measure.font='600 14px system-ui,sans-serif';
+  text(group,13+measure.measureText(P.title).width+5,titleY,`(${P.u})`,{fill:palette.mut,'font-family':'system-ui,sans-serif','font-size':12});
+  const w=wrap.clientWidth-M.l-M.r,h=wrap.clientHeight-M.t-M.b,[t0,t1]=view;
+  const x0=wrapX+M.l,y0=wrapY+M.t;
+  const X=t=>wrapX+M.l+(t-t0)/(t1-t0)*w,Y=v=>wrapY+M.t+h-(v-P.lo)/(P.hi-P.lo)*h;
+  const dec=P.hi-P.lo<2?2:P.hi-P.lo<20?1:0;
+  for(let i=0;i<=5;i++){
+   const v=P.lo+(P.hi-P.lo)*i/5,gy=y0+h-h*i/5,gx=x0+w*i/5;
+   add(group,'line',{x1:x0,y1:gy,x2:x0+w,y2:gy,stroke:palette.grid});
+   text(group,x0-6,gy+3,v.toFixed(dec),{fill:palette.mut,'font-family':'system-ui,sans-serif','font-size':11,'text-anchor':'end'});
+   add(group,'line',{x1:gx,y1:y0,x2:gx,y2:y0+h,stroke:palette.grid,'data-x-grid':i});
+   const anchor=i===0?'start':i===5?'end':'middle';
+   text(group,gx,y0+h+5,fmtT(t0+(t1-t0)*i/5,t1-t0),{fill:palette.mut,'font-family':'system-ui,sans-serif','font-size':11,'text-anchor':anchor,'dominant-baseline':'hanging','data-x-label':i});
+  }
+  const clipId=`chart-clip-${index}`;
+  const defs=add(group,'defs'),clip=add(defs,'clipPath',{id:clipId});
+  add(clip,'rect',{x:x0,y:y0-2,width:w+1,height:h+4});
+  const paths=add(group,'g',{ 'clip-path':`url(#${clipId})`,'stroke-linejoin':'round','fill':'none','data-chart-lines':''});
+  for(const s of series)for(const lineInfo of P.lines){
+   const d=svgLinePath(s,lineInfo.k,t0,t1,w,X,Y,P.sc);
+   if(d)add(paths,'path',{d,stroke:s.color,'stroke-width':lineInfo.s?2:1.5,'stroke-dasharray':lineInfo.s?'none':'5 3'});
+  }
+  const crosshair=add(group,'line',{x1:x0,y1:y0,x2:x0,y2:y0+h,stroke:palette.mut,'pointer-events':'none',opacity:0});
+  const selection=add(group,'rect',{x:x0,y:y0,width:0,height:h,fill:'#6ea0ff','fill-opacity':'.25','pointer-events':'none',visibility:'hidden'});
+  const markers=add(group,'g',{'pointer-events':'none'});
+  const hit=add(group,'rect',{x:x0,y:y0,width:w,height:h,fill:'transparent',cursor:'crosshair','data-plot':'','data-x':x0,'data-y':y0,'data-width':w,'data-height':h,'data-t0':t0,'data-t1':t1});
+  overlays.push({crosshair,selection,markers,hit,P,x0,y0,w,h});
+  y+=cardHeight+gap;
+ }
+ const resetButton=add(svg,'g',{id:'reset-zoom',role:'button',tabindex:'0',cursor:'pointer','aria-label':'Reset zoom to exported time range'});
+ add(resetButton,'rect',{x:width-92,y:5,width:82,height:24,rx:5,fill:palette.card,stroke:palette.bd});
+ text(resetButton,width-51,22,'Reset zoom',{fill:palette.fg,'font-family':'system-ui,sans-serif','font-size':11,'text-anchor':'middle'});
+ const tooltip=add(svg,'g',{id:'hover-tip',visibility:'hidden','pointer-events':'none'});
+ add(tooltip,'rect',{rx:7,fill:palette.card,stroke:palette.bd});
+ const tipText=add(tooltip,'g',{fill:palette.fg,'font-family':'system-ui,sans-serif','font-size':12});
+ const script=add(svg,'script',{type:'application/ecmascript'});
+ const panelConfigs=overlays.map(({P,x0,y0,w,h})=>({id:P.id,x0,y0,w,h,lo:P.lo,hi:P.hi,sc:P.sc,lines:P.lines.map(l=>({key:l.k,solid:!!l.s}))}));
+ script.textContent=`
+(()=>{const svg=document.documentElement,ns='http://www.w3.org/2000/svg',series=JSON.parse(document.getElementById('hover-data').textContent);
+ const tip=document.getElementById('hover-tip'),bg=tip.querySelector('rect'),tipText=tip.querySelector('g'),resetButton=document.getElementById('reset-zoom');
+ const panels=[...svg.querySelectorAll('[data-plot]')];
+  const configs=${JSON.stringify(panelConfigs)},initialRange=[Number(panels[0].dataset.t0),Number(panels[0].dataset.t1)];
+  let currentRange=initialRange.slice(),selection=null,lastClick=null;
+  const fmtRate=v=>v>=1e6?(v/1e6).toFixed(2)+' MB/s':(v/1e3).toFixed(1)+' KB/s';
+  const fmt=(v,d=1,s='')=>v==null?'–':Number(v).toFixed(d)+s;
+  const dateFmt=t=>new Date(t).toLocaleString();
+  const make=(name,attrs)=>{const e=document.createElementNS(ns,name);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);return e};
+  const hide=()=>{tip.setAttribute('visibility','hidden');panels.forEach(p=>{p.__cross.setAttribute('opacity',0);p.__markers.replaceChildren()})};
+  const timeLabel=(t,span)=>{const d=new Date(t),pad=n=>String(n).padStart(2,'0'),hm=pad(d.getHours())+':'+pad(d.getMinutes()),date=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());
+   return span>=1e12?date+' '+hm:span>2*864e5?pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+hm:span>5*6e4?hm:hm+':'+pad(d.getSeconds())};
+  const pathFor=(s,key,t0,t1,c,solid)=>{
+   const keys={tx:1,rx:2,up:3,dn:4,dbm:5},a=s.pts,index=keys[key];let low=0,high=a.length;
+   while(low<high){const m=(low+high)>>1;a[m][0]<t0?low=m+1:high=m}
+   const i=Math.max(0,low-1);low=i;high=a.length;while(low<high){const m=(low+high)>>1;a[m][0]<t1?low=m+1:high=m}
+   const end=Math.min(a.length,low+1),count=end-i,chosen=[];
+   if(count<=c.w*3){for(let k=i;k<end;k++)chosen.push(k)}
+   else{const buckets=Math.max(1,Math.floor(c.w)),min=new Int32Array(buckets).fill(-1),max=new Int32Array(buckets).fill(-1),missing=new Uint8Array(buckets);
+    for(let k=i;k<end;k++){const v=a[k][index],b=Math.min(buckets-1,Math.max(0,Math.floor((a[k][0]-t0)/(t1-t0)*buckets)));
+     if(v==null){missing[b]=1;continue}if(min[b]<0||v<a[min[b]][index])min[b]=k;if(max[b]<0||v>a[max[b]][index])max[b]=k}
+    for(let b=0;b<buckets;b++){if(min[b]>=0){const p=min[b],q=max[b];if(p===q)chosen.push(p);else p<q?chosen.push(p,q):chosen.push(q,p)}if(missing[b])chosen.push(-1)}}
+   let d='',pen=false,previous=0;
+   for(const k of chosen){if(k<0){pen=false;continue}const point=a[k],v=point[index];if(v==null){pen=false;continue}
+    const x=c.x0+(point[0]-t0)/(t1-t0)*c.w,y=c.y0+c.h-(v*c.sc-c.lo)/(c.hi-c.lo)*c.h;
+    d+=(pen&&point[0]-previous<=s.gap?'L':'M')+x+','+y;pen=true;previous=point[0]}
+   return d};
+  const setRange=range=>{currentRange=range;hide();panels.forEach((p,i)=>{
+   const c=configs[i],group=p.parentNode,lines=group.querySelector('[data-chart-lines]'),t0=range[0],t1=range[1];
+   lines.replaceChildren();
+   for(const s of series)for(const l of c.lines){const d=pathFor(s,l.key,t0,t1,c,l.solid);if(d)lines.appendChild(make('path',{d,stroke:s.color,'stroke-width':l.solid?2:1.5,'stroke-dasharray':l.solid?'none':'5 3'}))}
+   group.querySelectorAll('[data-x-grid]').forEach(el=>{const x=c.x0+c.w*Number(el.dataset.xGrid)/5;el.setAttribute('x1',x);el.setAttribute('x2',x)});
+   group.querySelectorAll('[data-x-label]').forEach(el=>{const i=Number(el.dataset.xLabel);el.setAttribute('x',c.x0+c.w*i/5);el.textContent=timeLabel(t0+(t1-t0)*i/5,t1-t0)});
+   p.dataset.t0=t0;p.dataset.t1=t1;p.__selection.setAttribute('visibility','hidden');
+  })};
+  panels.forEach((p,i)=>{const g=p.parentNode;p.__cross=g.querySelector('line[opacity]');p.__markers=g.querySelector('g[pointer-events="none"]');p.__selection=g.querySelector('rect[fill-opacity]');p.__config=configs[i]});
+  const position=e=>{const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;return pt.matrixTransform(svg.getScreenCTM().inverse())};
+  svg.addEventListener('pointerdown',e=>{const hit=e.target.closest('[data-plot]');if(!hit||e.button!==0)return;
+   const pos=position(e);selection={hit,start:pos.x,end:pos.x,startY:pos.y,endY:pos.y};hide();svg.setPointerCapture(e.pointerId)});
+  svg.addEventListener('pointermove',e=>{
+   if(selection){const pos=position(e);selection.end=pos.x;selection.endY=pos.y;const start=Math.min(selection.start,selection.end),end=Math.max(selection.start,selection.end);
+    panels.forEach(p=>{const c=p.__config,ratio0=(start-Number(selection.hit.dataset.x))/Number(selection.hit.dataset.width),ratio1=(end-Number(selection.hit.dataset.x))/Number(selection.hit.dataset.width);
+     const x0=c.x0+Math.max(0,Math.min(1,ratio0))*c.w,x1=c.x0+Math.max(0,Math.min(1,ratio1))*c.w;
+     p.__selection.setAttribute('x',x0);p.__selection.setAttribute('width',Math.max(0,x1-x0));p.__selection.setAttribute('visibility','visible')});
+    return}
+   const hit=e.target.closest('[data-plot]');if(!hit)return;
+   const pos=position(e);
+   const x0=Number(hit.dataset.x),y0=Number(hit.dataset.y),w=Number(hit.dataset.width),h=Number(hit.dataset.height);
+  const t0=Number(hit.dataset.t0),t1=Number(hit.dataset.t1),x=Math.max(x0,Math.min(x0+w,pos.x));
+  const t=t0+(x-x0)/w*(t1-t0),rows=[];
+  for(const s of series){
+   let lo=0,hi=s.pts.length;while(lo<hi){const m=(lo+hi)>>1;s.pts[m][0]<t?lo=m+1:hi=m}
+   const a=s.pts[lo-1],b=s.pts[lo],p=!a?b:!b?a:Math.abs(a[0]-t)<=Math.abs(b[0]-t)?a:b;
+   if(p&&Math.abs(p[0]-t)<=s.gap)rows.push({s,p});
+  }
+  panels.forEach(hitPanel=>{
+   const panelX=Number(hitPanel.dataset.x)+(x-x0)/w*Number(hitPanel.dataset.width);
+   hitPanel.__cross.setAttribute('x1',panelX);hitPanel.__cross.setAttribute('x2',panelX);hitPanel.__cross.setAttribute('opacity',1);
+   hitPanel.__markers.replaceChildren();
+   const config=hitPanel.__config;
+   for(const {s,p} of rows){const valMap={tx:p[1],rx:p[2],up:p[3],dn:p[4],dbm:p[5]};
+    for(const l of config.lines){const v=valMap[l.key];if(v==null)continue;const cy=config.y0+config.h-(v*config.sc-config.lo)/(config.hi-config.lo)*config.h;
+     hitPanel.__markers.appendChild(make('circle',{cx:panelX,cy,r:3.5,fill:s.color}));
+    }
+   }
+  });
+  tipText.replaceChildren();
+  const lines=rows.length?[dateFmt(rows[0].p[0]),...rows.map(({s,p})=>s.name+(p[7]?' · '+p[7]:'')+'\\nLink TX '+fmt(p[1])+' / RX '+fmt(p[2],1,' Mbps')+(p[3]==null?'':' · Up '+fmtRate(p[3])+' / Down '+fmtRate(p[4]))+(p[5]==null?'':' · '+fmt(p[5],0,' dBm')+(p[6]==null?'':' ('+p[6]+'%)')))] :[];
+  if(!lines.length){tip.setAttribute('visibility','hidden');return}
+  let maxWidth=0;lines.forEach((line,i)=>{const tx=make('text',{x:8,y:17+i*17});tx.textContent=line;tipText.appendChild(tx);maxWidth=Math.max(maxWidth,line.length*6.5)});
+  const tw=maxWidth+16,th=lines.length*17+8,svgWidth=Number(svg.getAttribute('width')),svgHeight=Number(svg.getAttribute('height'));
+  const tx=Math.max(2,Math.min(svgWidth-tw-2,pos.x+14)),ty=Math.max(2,Math.min(svgHeight-th-2,pos.y+14));
+  bg.setAttribute('width',tw);bg.setAttribute('height',th);tip.setAttribute('transform','translate('+tx+' '+ty+')');tip.setAttribute('visibility','visible');
+ });
+ svg.addEventListener('pointerup',e=>{if(!selection)return;const current=selection, start=current.start,end=current.end,hit=current.hit,range=[Number(hit.dataset.t0),Number(hit.dataset.t1)];
+ selection=null;if(Math.abs(end-start)>8){lastClick=null;const x0=Number(hit.dataset.x),w=Number(hit.dataset.width),a=Math.max(0,Math.min(1,(Math.min(start,end)-x0)/w)),b=Math.max(0,Math.min(1,(Math.max(start,end)-x0)/w));
+   const next=[range[0]+a*(range[1]-range[0]),range[0]+b*(range[1]-range[0])];if(next[1]-next[0]>1)setRange(next);else panels.forEach(p=>p.__selection.setAttribute('visibility','hidden'))}
+ else{panels.forEach(p=>p.__selection.setAttribute('visibility','hidden'));
+  const pos=position(e),now=Date.now(),isDouble=lastClick&&now-lastClick.time<600&&Math.hypot(pos.x-lastClick.x,pos.y-lastClick.y)<12;
+  if(isDouble){lastClick=null;setRange(initialRange.slice())}else lastClick={time:now,x:pos.x,y:pos.y};
+ }
+ });
+ const reset=()=>{lastClick=null;setRange(initialRange.slice())};
+ resetButton.addEventListener('click',reset);
+ resetButton.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();reset()}});
+ svg.addEventListener('dblclick',e=>{const pos=position(e),hit=panels.find(p=>{const c=p.__config;return pos.x>=c.x0&&pos.x<=c.x0+c.w&&pos.y>=c.y0&&pos.y<=c.y0+c.h});
+ if(hit){e.preventDefault();reset()}});
+ svg.addEventListener('pointerleave',()=>{if(!selection)hide()});
+})();`;
+ const xml=new XMLSerializer().serializeToString(svg);
+ const blob=new Blob([xml],{type:'image/svg+xml;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');
+ link.href=url;link.download=`wifi-log-${new Date().toISOString().replace(/[:.]/g,'-')}.svg`;
+ link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$('#msg').textContent='';
+ }catch(error){$('#msg').textContent=`Could not export SVG: ${error.message}`}
+}
+
+function svgLinePath(s,key,t0,t1,w,X,Y,sc){
+ const a=s.pts,i=Math.max(0,lb(a,t0)-1),j=Math.min(a.length,lb(a,t1)+1),count=j-i,idx=[];
+ if(count<=w*3){for(let k=i;k<j;k++)idx.push(k)}
+ else{const B=Math.max(1,Math.floor(w)),span=t1-t0,mn=new Int32Array(B).fill(-1),mx=new Int32Array(B).fill(-1),nan=new Uint8Array(B);
+  for(let k=i;k<j;k++){const v=a[k][key],b=Math.min(B-1,Math.max(0,Math.floor((a[k].t-t0)/span*B)));
+   if(isNaN(v)){nan[b]=1;continue}
+   if(mn[b]<0||v<a[mn[b]][key])mn[b]=k;if(mx[b]<0||v>a[mx[b]][key])mx[b]=k}
+  for(let b=0;b<B;b++){if(mn[b]>=0){const p=mn[b],q=mx[b];if(p===q)idx.push(p);else p<q?idx.push(p,q):idx.push(q,p)}if(nan[b])idx.push(-1)}}
+ let d='',pen=false,pt=0;
+ for(const k of idx){if(k<0){pen=false;continue}const p=a[k],v=p[key];if(isNaN(v)){pen=false;continue}
+  const gap=pen&&p.t-pt>s.gap,cmd=pen&&!gap?'L':'M';d+=`${cmd}${X(p.t)},${Y(v*sc)}`;pen=true;pt=p.t}
+ return d}
+
+async function exportPng(){
+ const charts=$('#charts'),cards=[...charts.querySelectorAll('.card')],width=charts.clientWidth;
+ if(!cards.length||!width){$('#msg').textContent='There are no charts to export.';return}
+ const gap=12,height=cards.reduce((sum,c)=>sum+c.clientHeight,0)+gap*(cards.length-1),scale=3;
+ const out=document.createElement('canvas');out.width=width*scale;out.height=height*scale;
+ const g=out.getContext('2d');
+ if(!g){$('#msg').textContent='Could not create an image for export.';return}
+ g.scale(scale,scale);g.fillStyle=css('--bg');g.fillRect(0,0,width,height);
+ let y=0;
+ for(const card of cards){
+  const P=PANELS.find(p=>p.cv===card.querySelector('canvas'));
+  if(!P)continue;
+  const cardHeight=card.clientHeight,cardRect=card.getBoundingClientRect(),headingRect=card.querySelector('h2').getBoundingClientRect();
+  g.fillStyle=css('--card');g.strokeStyle=css('--bd');g.lineWidth=1;
+  g.beginPath();g.roundRect(.5,y+.5,width-1,cardHeight-1,12);g.fill();g.stroke();
+  const titleY=y+headingRect.top-cardRect.top+15;
+  g.textAlign='left';g.textBaseline='alphabetic';g.fillStyle=css('--fg');
+  g.font='600 14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  g.fillText(P.title,13,titleY);
+  const titleWidth=g.measureText(P.title).width;
+  g.fillStyle=css('--mut');g.font='12px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  g.fillText(`(${P.u})`,13+titleWidth+5,titleY);
+  const wrap=card.querySelector('.wrap'),wrapRect=wrap.getBoundingClientRect();
+  const wrapX=wrapRect.left-cardRect.left,wrapY=y+wrapRect.top-cardRect.top;
+  g.save();g.translate(wrapX,wrapY);drawPanel(P,g,wrap.clientWidth,wrap.clientHeight);g.restore();
+  y+=cardHeight+gap;
+ }
+ try{
+  const blob=await new Promise((resolve,reject)=>out.toBlob(b=>b?resolve(b):reject(new Error('PNG encoding failed.')),'image/png'));
+  const url=URL.createObjectURL(blob),link=document.createElement('a');
+  link.href=url;link.download=`wifi-log-${new Date().toISOString().replace(/[:.]/g,'-')}.png`;
+  link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$('#msg').textContent='';
+ }catch(error){$('#msg').textContent=`Could not export PNG: ${error.message}`}
+}
+
+function line(g,s,key,t0,t1,X,Y,sc,w){
+ const a=s.pts,i=Math.max(0,lb(a,t0)-1),j=Math.min(a.length,lb(a,t1)+1),n=j-i,idx=[];
+ if(n<=w*3){for(let k=i;k<j;k++)idx.push(k)}
+ else{const B=Math.max(1,Math.floor(w)),sp=t1-t0,mn=new Int32Array(B).fill(-1),mx=new Int32Array(B).fill(-1),nan=new Uint8Array(B);
+  for(let k=i;k<j;k++){const v=a[k][key],b=Math.min(B-1,Math.max(0,Math.floor((a[k].t-t0)/sp*B)));
+   if(isNaN(v)){nan[b]=1;continue}
+   if(mn[b]<0||v<a[mn[b]][key])mn[b]=k;if(mx[b]<0||v>a[mx[b]][key])mx[b]=k}
+  for(let b=0;b<B;b++){if(mn[b]>=0){const p=mn[b],q=mx[b];if(p==q)idx.push(p);else p<q?idx.push(p,q):idx.push(q,p)}if(nan[b])idx.push(-1)}}
+ g.beginPath();let pen=false,pt=0;
+ for(const k of idx){if(k<0){pen=false;continue}const p=a[k],v=p[key];if(isNaN(v)){pen=false;continue}
+  if(pen&&p.t-pt>s.gap)pen=false;const x=X(p.t),y=Y(v*sc);pen?g.lineTo(x,y):g.moveTo(x,y);pen=true;pt=p.t}
+ g.stroke()}
+
+const tAt=(P,x)=>{const w=P.cv.clientWidth-M.l-M.r;return view[0]+Math.min(1,Math.max(0,(x-M.l)/w))*(view[1]-view[0])};
+function clearOv(){PANELS.forEach(P=>P.has&&size(P.ov))}
+
+function hover(e,P){
+ const x=e.offsetX;
+ if(drag){drag.x1=x;clearOv();const[g,W,H]=size(P.ov);g.fillStyle='rgba(110,160,255,.25)';g.fillRect(Math.min(drag.x0,x),M.t,Math.abs(x-drag.x0),H-M.t-M.b);return}
+ const t=tAt(P,x),rows=[];
+ for(const s of S){if(!on.has(s.name))continue;const a=s.pts,i=lb(a,t),c=[a[i-1],a[i]].filter(Boolean).sort((p,q)=>Math.abs(p.t-t)-Math.abs(q.t-t))[0];
+  if(c&&Math.abs(c.t-t)<=s.gap)rows.push({s,p:c})}
+ clearOv();
+ PANELS.forEach(Q=>{if(!Q.has)return;const[g,W,H]=size(Q.ov),w=W-M.l-M.r,h=H-M.t-M.b,px=M.l+(t-view[0])/(view[1]-view[0])*w;
+  g.strokeStyle=css('--mut');g.lineWidth=1;g.beginPath();g.moveTo(Math.round(px)+.5,M.t);g.lineTo(Math.round(px)+.5,M.t+h);g.stroke();
+  for(const{s,p}of rows)for(const l of Q.lines){const v=p[l.k];if(isNaN(v))continue;const X=M.l+(p.t-view[0])/(view[1]-view[0])*w,Y=M.t+h-(v*Q.sc-Q.lo)/(Q.hi-Q.lo)*h;
+   g.fillStyle=s.color;g.beginPath();g.arc(X,Y,3.5,0,7);g.fill()}});
+ const tip=$('#tip');
+ if(!rows.length){tip.style.display='none';return}
+ const f=(v,d,u)=>isNaN(v)?'–':v.toFixed(d)+u;
+ tip.innerHTML=`<b>${new Date(rows[0].p.t).toLocaleString()}</b>`+rows.map(({s,p})=>
+  `<div><span class="dot" style="background:${s.color}"></span> ${s.name.replace(/</g,'&lt;')}${p.ssid?' · '+p.ssid.replace(/</g,'&lt;'):''}<br>`+
+  `Link TX ${f(p.tx,1,'')} / RX ${f(p.rx,1,' Mbps')}`+(isNaN(p.up)?'':` · Up ${fmtRate(p.up)} / Down ${fmtRate(p.dn)}`)+
+  (isNaN(p.dbm)?'':` · ${p.dbm.toFixed(0)} dBm${isNaN(p.pct)?'':' ('+p.pct+'%)'}`)+`</div>`).join('');
+ tip.style.display='block';const r=tip.getBoundingClientRect();
+ tip.style.left=Math.min(innerWidth-r.width-8,e.clientX+14)+'px';tip.style.top=Math.max(8,Math.min(innerHeight-r.height-8,e.clientY+14))+'px'}
+
+document.querySelectorAll('button[data-r]').forEach(b=>b.onclick=()=>{const r=b.dataset.r;
+ view=(r=='all'||r=='zoom')?full.slice():[Math.max(full[0],full[1]-r*1000),full[1]];layout()});
+$('#export-svg').onclick=exportSvg;
+$('#export').onclick=exportPng;
+const drop=$('#drop');
+$('#file').onchange=e=>load(e.target.files);
+['dragenter','dragover'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(n=>drop.addEventListener(n,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>load(e.dataTransfer.files));
+addEventListener('dragover',e=>e.preventDefault());addEventListener('drop',e=>{e.preventDefault();if(e.target!==drop&&e.dataTransfer.files.length)load(e.dataTransfer.files)});
+addEventListener('resize',()=>S.length&&draw());
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>S.length&&draw());
+</script>
+</body>
+</html>
